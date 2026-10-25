@@ -1,0 +1,27 @@
+spring:
+  application:
+    name: newsprocessor-server
+  config:
+    import: optional:classpath:db.properties
+  datasource:
+    url: ${db.jdbcUrl}
+    username: ${db.user}
+    password: ${db.password}
+    hikari:
+      connection-timeout: 15000
+  jpa:
+    open-in-view: false
+    hibernate:
+      ddl-auto: validate
+    properties:
+      hibernate.jdbc.time_zone: UTC
+  flyway:
+    enabled: true
+    baseline-on-migrate: true
+    baseline-version: "2"
+
+server:
+  port: 6060
+  error:
+    include-message: never
+    include-stacktrace: never
