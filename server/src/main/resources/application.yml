@@ -20,6 +20,10 @@ spring:
     baseline-on-migrate: true
     baseline-version: "2"
 
+gemini:
+  api-key: ${gemini.apiKey:${GEMINI_API_KEY:${GOOGLE_API_KEY:}}}
+  model: gemini-3.5-flash-lite
+
 server:
   port: 6060
   error:

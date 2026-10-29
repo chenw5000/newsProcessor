@@ -21,7 +21,13 @@ Or, from `server`:
 psql -U postgres -h localhost -f scripts/create-database.sql
 ```
 
-The API creates the tables on startup. Edit `server/src/main/resources/db.properties` to change the JDBC URL, user, or password, then restart the server.
+Copy the connection template, then edit the local file (it is gitignored):
+
+```powershell
+copy server\src\main\resources\db.properties.example server\src\main\resources\db.properties
+```
+
+Put the JDBC URL, user, and password in `db.properties`, then restart the server.
 
 ## Run
 

@@ -1,0 +1,6 @@
+# Copy this file to db.properties and fill in local values.
+# db.properties is gitignored and must not be committed.
+db.jdbcUrl=jdbc:postgresql://localhost:5432/newprocessor?socketTimeout=60000&connectTimeout=15000
+db.user=gcadmin
+db.password=change-me
+gemini.apiKey=change-me

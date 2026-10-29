@@ -1,3 +1,7 @@
 .DS_Store
 Thumbs.db
 *.log
+
+# Local database credentials
+server/src/main/resources/db.properties
+
