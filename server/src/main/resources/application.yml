@@ -24,6 +24,11 @@ gemini:
   api-key: ${gemini.apiKey:${GEMINI_API_KEY:${GOOGLE_API_KEY:}}}
   model: gemini-3.5-flash-lite
 
+news:
+  schedule:
+    # How often the scheduler re-reads app_setting and may start a run.
+    tick-ms: 30000
+
 server:
   port: 6060
   error:

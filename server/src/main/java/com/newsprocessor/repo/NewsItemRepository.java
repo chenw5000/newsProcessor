@@ -2,6 +2,7 @@ package com.newsprocessor.repo;
 
 import com.newsprocessor.domain.NewsItem;
 import java.time.Instant;
+import java.util.Collection;
 import java.util.List;
 import java.util.Optional;
 import org.springframework.data.jpa.repository.JpaRepository;
@@ -24,8 +25,21 @@ public interface NewsItemRepository extends JpaRepository<NewsItem, Long> {
             @Param("tickerId") Integer tickerId,
             @Param("since") Instant since);
 
-    List<NewsItem> findByStoryClusterId(Long storyClusterId);
+    List<NewsItem> findByBatchIdIn(Collection<Long> batchIds);
 
-    @Query(value = "select nextval('news_story_cluster_id_seq')", nativeQuery = true)
-    Long nextStoryClusterId();
+    @Query("""
+            select ni from NewsItem ni
+            where ni.tickerId = :tickerId
+              and (
+                    ni.createdAt >= :since
+                 or ni.batchId in :batchIds
+              )
+            order by ni.createdAt desc
+            """)
+    List<NewsItem> findExclusionCandidates(
+            @Param("tickerId") Integer tickerId,
+            @Param("since") Instant since,
+            @Param("batchIds") Collection<Long> batchIds);
+
+    List<NewsItem> findByStoryClusterId(Long storyClusterId);
 }

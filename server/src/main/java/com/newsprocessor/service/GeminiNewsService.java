@@ -11,16 +11,22 @@ import com.google.genai.types.Type;
 import com.newsprocessor.config.GeminiProperties;
 import com.newsprocessor.domain.NewsBatch;
 import com.newsprocessor.domain.NewsItem;
+import com.newsprocessor.domain.NewsStoryCluster;
 import com.newsprocessor.domain.Stock;
+import com.newsprocessor.domain.AppSetting;
+import com.newsprocessor.repo.AppSettingRepository;
 import com.newsprocessor.repo.NewsBatchRepository;
 import com.newsprocessor.repo.NewsItemRepository;
+import com.newsprocessor.repo.NewsStoryClusterRepository;
 import com.newsprocessor.repo.StockRepository;
+import com.newsprocessor.service.schedule.AnalyzeScheduleService;
 import com.newsprocessor.service.dto.GeminiNewsResponse;
 import com.newsprocessor.service.dto.GeminiNewsResponse.HorizonWindow;
 import com.newsprocessor.service.dto.GeminiNewsResponse.NewsEntry;
 import com.newsprocessor.service.dto.GeminiNewsResponse.NormalizedIndex;
 import com.newsprocessor.service.dto.GeminiNewsResponse.TickerNews;
 import com.newsprocessor.service.dto.GeminiNewsResponse.TimeHorizonOutlook;
+import java.time.Duration;
 import java.time.Instant;
 import java.time.LocalDateTime;
 import java.time.LocalTime;
@@ -30,11 +36,13 @@ import java.time.format.DateTimeParseException;
 import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.HashSet;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
+import org.springframework.data.domain.PageRequest;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.http.HttpStatus;
@@ -48,6 +56,9 @@ public class GeminiNewsService {
 
     private static final Logger log = LoggerFactory.getLogger(GeminiNewsService.class);
     private static final String TICKER_PLACEHOLDER = "[INSERT LIST OF TICKERS, e.g., NVDA, AAPL]";
+    private static final String EXCLUSION_PLACEHOLDER = "{{ALREADY_COVERED_SECTION}}";
+    private static final Duration EXCLUSION_LOOKBACK = Duration.ofHours(2);
+    private static final int EXCLUSION_LAST_BATCHES = 2;
     private static final DateTimeFormatter RELEASE_DATE_TIME =
             DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
     private static final String PROMPT_TEMPLATE = """
@@ -58,10 +69,15 @@ public class GeminiNewsService {
             Please perform the following steps for each asset:
 
             1. NEWS AGGREGATION & SOURCE ATTRIBUTION:
-            Gather ONLY verified, real-world headlines from the past 24 hours. Do not simulate, guess, or fabricate any news items. Gather 4-6 items if available. You must classify each source according to this strict media tier framework:
+            Gather ONLY verified, real-world headlines from the past 24 hours. Do not simulate, guess, or fabricate any news items. Prefer up to 4-6 NEW items if available. You must classify each source according to this strict media tier framework:
             - Tier 1: Institutional Wires (Reuters, Bloomberg, WSJ, Dow Jones Newswires)
             - Tier 2: Mainstream Outlets (CNBC, Yahoo Finance, Financial Times)
             - Tier 3: Sector Specialists (The Information, DigiTimes, Benzinga, MarketWatch)
+
+            1b. ALREADY COVERED / NO FILLERS:
+            Below is a list of source+headline pairs already collected recently for these tickers. Do NOT repeat them (exact match, paraphrase, or the same underlying story). Prefer other distinct verified stories from the past 24 hours.
+            If nothing new exists beyond the exclusion list, return fewer items or an empty news array for that ticker. Do NOT invent, guess, or rephrase excluded headlines to pad the list.
+            {{ALREADY_COVERED_SECTION}}
 
             2. INDIVIDUAL SENTIMENT SCORING:
             Rate the potential market impact of EACH news item individually on a raw scale from -100 (extreme panic/bearish) to +100 (extreme euphoria/bullish). Justify the score based on institutional market reactions.
@@ -119,11 +135,16 @@ public class GeminiNewsService {
             }
             """;
 
+    private static final int DEFAULT_CHUNK_SIZE = 8;
+    private static final int DEFAULT_CHUNK_PAUSE_SECONDS = 30;
+
     private final GeminiProperties geminiProperties;
     private final ObjectMapper objectMapper;
     private final StockRepository stocks;
     private final NewsBatchRepository batches;
     private final NewsItemRepository items;
+    private final NewsStoryClusterRepository storyClusters;
+    private final AppSettingRepository appSettings;
     private final TransactionTemplate transactionTemplate;
 
     public GeminiNewsService(
@@ -131,23 +152,165 @@ public class GeminiNewsService {
             StockRepository stocks,
             NewsBatchRepository batches,
             NewsItemRepository items,
+            NewsStoryClusterRepository storyClusters,
+            AppSettingRepository appSettings,
             PlatformTransactionManager transactionManager) {
         this.geminiProperties = geminiProperties;
         this.objectMapper = new ObjectMapper();
         this.stocks = stocks;
         this.batches = batches;
         this.items = items;
+        this.storyClusters = storyClusters;
+        this.appSettings = appSettings;
         this.transactionTemplate = new TransactionTemplate(transactionManager);
     }
 
     public String buildPrompt(List<String> tickers) {
-        return PROMPT_TEMPLATE.replace(TICKER_PLACEHOLDER, formatTickers(tickers));
+        return PROMPT_TEMPLATE
+                .replace(TICKER_PLACEHOLDER, formatTickers(tickers))
+                .replace(EXCLUSION_PLACEHOLDER, buildExclusionSection(tickers));
+    }
+
+    /**
+     * Builds the ALREADY COVERED block: source+headline from items in the last 2 hours
+     * or belonging to the last 2 batches per ticker.
+     */
+    String buildExclusionSection(List<String> tickers) {
+        Instant since = Instant.now().minus(EXCLUSION_LOOKBACK);
+        StringBuilder section = new StringBuilder("ALREADY COVERED (source | headline):");
+        boolean any = false;
+        for (String ticker : tickers) {
+            List<String> lines = loadExclusionLines(ticker, since);
+            if (lines.isEmpty()) {
+                continue;
+            }
+            any = true;
+            section.append('\n').append(ticker).append(':');
+            for (String line : lines) {
+                section.append("\n- ").append(line);
+            }
+        }
+        if (!any) {
+            return "ALREADY COVERED (source | headline):\nnone";
+        }
+        return section.toString();
+    }
+
+    private List<String> loadExclusionLines(String ticker, Instant since) {
+        Stock stock = stocks.findFirstByTickerIgnoreCase(ticker).orElse(null);
+        if (stock == null || stock.getId() == null) {
+            return List.of();
+        }
+        Integer tickerId = toTickerId(stock.getId());
+        List<Long> recentBatchIds = batches.findIdsByTickerIdOrderByIdDesc(
+                tickerId, PageRequest.of(0, EXCLUSION_LAST_BATCHES));
+
+        List<NewsItem> candidates;
+        if (recentBatchIds.isEmpty()) {
+            candidates = items.findRecentByTickerId(tickerId, since);
+        } else {
+            candidates = items.findExclusionCandidates(tickerId, since, recentBatchIds);
+        }
+
+        Set<String> seen = new LinkedHashSet<>();
+        List<String> lines = new ArrayList<>();
+        for (NewsItem item : candidates) {
+            String source = blankToNull(item.getSource());
+            String headline = blankToNull(item.getHeadline());
+            if (source == null || headline == null) {
+                continue;
+            }
+            String fingerprint = item.getHeadlineFingerprint();
+            if (fingerprint == null || fingerprint.isBlank()) {
+                fingerprint = NewsStorySupport.fingerprint(ticker, source, headline);
+            }
+            if (!seen.add(fingerprint)) {
+                continue;
+            }
+            lines.add(source + " | " + headline);
+        }
+        return lines;
     }
 
     public GeminiNewsPersistResult analyzeAndStore(List<String> tickers) {
         List<String> cleaned = cleanTickers(tickers);
-        GeminiNewsResponse response = requestAnalysis(cleaned);
-        return transactionTemplate.execute(status -> persist(response, cleaned));
+        return analyzeInChunks(cleaned);
+    }
+
+    /**
+     * Loads tickers from {@code stock} where {@code enabled = true}, then analyzes in
+     * chunks sized by {@code schedule.chunk_size}.
+     */
+    public GeminiNewsPersistResult analyzeEnabledStocks() {
+        List<String> enabledTickers = stocks.findEnabledTickers();
+        if (enabledTickers.isEmpty()) {
+            throw new ResponseStatusException(
+                    HttpStatus.BAD_REQUEST,
+                    "No enabled stocks found. Set stock.enabled = true for at least one ticker.");
+        }
+        log.info("Analyzing {} enabled stock(s): {}", enabledTickers.size(), enabledTickers);
+        return analyzeInChunks(enabledTickers);
+    }
+
+    private GeminiNewsPersistResult analyzeInChunks(List<String> tickers) {
+        int chunkSize = readPositiveSetting(AnalyzeScheduleService.KEY_CHUNK_SIZE, DEFAULT_CHUNK_SIZE);
+        int pauseSeconds = readNonNegativeSetting(
+                AnalyzeScheduleService.KEY_CHUNK_PAUSE_SECONDS, DEFAULT_CHUNK_PAUSE_SECONDS);
+        int totalChunks = (tickers.size() + chunkSize - 1) / chunkSize;
+        log.info(
+                "Gemini chunking: {} ticker(s) -> {} chunk(s) of up to {} (pause {}s)",
+                tickers.size(),
+                totalChunks,
+                chunkSize,
+                pauseSeconds);
+
+        GeminiNewsPersistResult combined = null;
+        for (int from = 0, chunkIndex = 1; from < tickers.size(); from += chunkSize, chunkIndex++) {
+            List<String> chunk = tickers.subList(from, Math.min(from + chunkSize, tickers.size()));
+            log.info("Gemini chunk {}/{}: {}", chunkIndex, totalChunks, chunk);
+            GeminiNewsResponse response = requestAnalysis(chunk);
+            List<String> chunkCopy = List.copyOf(chunk);
+            GeminiNewsPersistResult part =
+                    transactionTemplate.execute(status -> persist(response, chunkCopy));
+            combined = GeminiNewsPersistResult.merge(combined, part);
+            if (from + chunkSize < tickers.size() && pauseSeconds > 0) {
+                sleepQuietly(pauseSeconds);
+            }
+        }
+        return combined == null
+                ? new GeminiNewsPersistResult(List.of(), 0, 0, 0, 0, null, null)
+                : combined;
+    }
+
+    private int readPositiveSetting(String key, int fallback) {
+        return Math.max(1, readIntSetting(key, fallback));
+    }
+
+    private int readNonNegativeSetting(String key, int fallback) {
+        return Math.max(0, readIntSetting(key, fallback));
+    }
+
+    private int readIntSetting(String key, int fallback) {
+        return appSettings.findById(key)
+                .map(AppSetting::getValue)
+                .map(value -> {
+                    try {
+                        return Integer.parseInt(value.trim());
+                    } catch (Exception exception) {
+                        return fallback;
+                    }
+                })
+                .orElse(fallback);
+    }
+
+    private static void sleepQuietly(int seconds) {
+        try {
+            log.info("Pausing {}s before next Gemini chunk", seconds);
+            Thread.sleep(seconds * 1000L);
+        } catch (InterruptedException exception) {
+            Thread.currentThread().interrupt();
+            throw new ResponseStatusException(HttpStatus.SERVICE_UNAVAILABLE, "Analyze interrupted");
+        }
     }
 
     public GeminiNewsResponse requestAnalysis(List<String> tickers) {
@@ -162,6 +325,7 @@ public class GeminiNewsService {
         String prompt = buildPrompt(cleaned);
         String model = blankToDefault(geminiProperties.getModel(), "gemini-3.5-flash-lite");
         log.info("Requesting Gemini news analysis for {} using model {}", cleaned, model);
+        log.debug("Gemini prompt exclusion section:\n{}", buildExclusionSection(cleaned));
 
         // Align with StockSugg: JSON mime + response schema, no Google Search tool.
         GenerateContentConfig config = GenerateContentConfig.builder()
@@ -294,7 +458,9 @@ public class GeminiNewsService {
         int itemCount = 0;
         int skippedDuplicateCount = 0;
         int clusteredCount = 0;
-        int maxHotness = 0;
+        int maxOverallHotness = 0;
+        Double minAggregateSentiment = null;
+        Double maxAggregateSentiment = null;
         Set<String> seenFingerprints = new HashSet<>();
 
         List<TickerNews> tickerNews = response.getNewsItems();
@@ -355,35 +521,68 @@ public class GeminiNewsService {
                 item.setScore(entry.getScore());
                 item.setJustification(entry.getJustification());
                 item.setHeadlineFingerprint(fingerprint);
+                item.setItemHotness(NewsStorySupport.tierHotnessWeight(item.getMediaTier()));
 
                 // V2: soft cluster across sources for near-same stories.
                 Long matchedClusterId = findMatchingStoryCluster(item, recentForTicker);
-                boolean joinedExistingCluster = matchedClusterId != null;
-                if (joinedExistingCluster) {
+                if (matchedClusterId != null) {
                     item.setStoryClusterId(matchedClusterId);
                     clusteredCount++;
                 } else {
-                    item.setStoryClusterId(items.nextStoryClusterId());
+                    NewsStoryCluster created = createStoryCluster(tickerId, item, createdAt);
+                    item.setStoryClusterId(created.getId());
                 }
-                item.setHotness(1);
 
                 NewsItem saved = items.save(item);
                 recentForTicker.add(0, saved);
-                int hotness = refreshClusterHotness(saved.getStoryClusterId());
-                maxHotness = Math.max(maxHotness, hotness);
+                NewsStoryCluster refreshed = refreshClusterMetrics(saved.getStoryClusterId(), createdAt);
+                if (refreshed != null) {
+                    maxOverallHotness = Math.max(
+                            maxOverallHotness,
+                            refreshed.getOverallHotness() == null ? 0 : refreshed.getOverallHotness());
+                    Double sentiment = refreshed.getAggregateSentiment();
+                    if (sentiment != null) {
+                        minAggregateSentiment = minAggregateSentiment == null
+                                ? sentiment
+                                : Math.min(minAggregateSentiment, sentiment);
+                        maxAggregateSentiment = maxAggregateSentiment == null
+                                ? sentiment
+                                : Math.max(maxAggregateSentiment, sentiment);
+                    }
+                }
                 itemCount++;
             }
         }
 
         log.info(
-                "Stored {} batches, {} items (skippedDuplicates={}, clustered={}, maxHotness={})",
+                "Stored {} batches, {} items (skippedDuplicates={}, clustered={}, maxOverallHotness={})",
                 batchIds.size(),
                 itemCount,
                 skippedDuplicateCount,
                 clusteredCount,
-                maxHotness);
+                maxOverallHotness);
         return new GeminiNewsPersistResult(
-                batchIds, itemCount, skippedDuplicateCount, clusteredCount, maxHotness);
+                batchIds,
+                itemCount,
+                skippedDuplicateCount,
+                clusteredCount,
+                maxOverallHotness,
+                minAggregateSentiment,
+                maxAggregateSentiment);
+    }
+
+    private NewsStoryCluster createStoryCluster(Integer tickerId, NewsItem item, Instant now) {
+        NewsStoryCluster cluster = new NewsStoryCluster();
+        cluster.setTickerId(tickerId);
+        cluster.setCanonicalHeadline(item.getHeadline());
+        cluster.setCoreTheme(item.getCoreTheme());
+        cluster.setOverallHotness(item.getItemHotness() == null ? 1 : item.getItemHotness());
+        cluster.setAggregateSentiment(item.getScore() == null ? null : item.getScore().doubleValue());
+        cluster.setSourceCount(1);
+        cluster.setFirstSeenAt(now);
+        cluster.setLastSeenAt(now);
+        cluster.setCreatedAt(now);
+        return storyClusters.save(cluster);
     }
 
     private static boolean isHardDuplicateAgainstRecent(
@@ -420,22 +619,38 @@ public class GeminiNewsService {
         return null;
     }
 
-    private int refreshClusterHotness(Long storyClusterId) {
+    private NewsStoryCluster refreshClusterMetrics(Long storyClusterId, Instant now) {
         if (storyClusterId == null) {
-            return 1;
+            return null;
+        }
+        NewsStoryCluster cluster = storyClusters.findById(storyClusterId).orElse(null);
+        if (cluster == null) {
+            return null;
         }
         List<NewsItem> clusterItems = items.findByStoryClusterId(storyClusterId);
         if (clusterItems.isEmpty()) {
-            return 1;
+            return cluster;
         }
-        List<String> sources = clusterItems.stream().map(NewsItem::getSource).toList();
-        List<String> tiers = clusterItems.stream().map(NewsItem::getMediaTier).toList();
-        int hotness = NewsStorySupport.computeHotness(sources, tiers);
-        for (NewsItem member : clusterItems) {
-            member.setHotness(hotness);
+
+        int overallHotness = NewsStorySupport.computeOverallHotness(clusterItems);
+        Double aggregateSentiment = NewsStorySupport.computeAggregateSentiment(clusterItems);
+        int sourceCount = NewsStorySupport.latestPerSource(clusterItems).size();
+        NewsItem canonical = NewsStorySupport.pickCanonicalItem(clusterItems);
+
+        cluster.setOverallHotness(overallHotness);
+        cluster.setAggregateSentiment(aggregateSentiment);
+        cluster.setSourceCount(Math.max(sourceCount, 1));
+        cluster.setLastSeenAt(now);
+        if (canonical != null) {
+            cluster.setCanonicalHeadline(canonical.getHeadline());
+            if (canonical.getCoreTheme() != null && !canonical.getCoreTheme().isBlank()) {
+                cluster.setCoreTheme(canonical.getCoreTheme());
+            }
         }
-        items.saveAll(clusterItems);
-        return hotness;
+        if (cluster.getFirstSeenAt() == null) {
+            cluster.setFirstSeenAt(now);
+        }
+        return storyClusters.save(cluster);
     }
 
     private Stock findOrCreateStock(String rawTicker) {
@@ -444,6 +659,7 @@ public class GeminiNewsService {
             Stock created = new Stock();
             created.setTicker(ticker);
             created.setName(ticker);
+            created.setEnabled(true);
             return stocks.save(created);
         });
     }

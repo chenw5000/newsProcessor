@@ -8,7 +8,9 @@ public class AnalyzeNewsResponse {
     private int itemCount;
     private int skippedDuplicateCount;
     private int clusteredCount;
-    private int maxHotness;
+    private int maxOverallHotness;
+    private Double minAggregateSentiment;
+    private Double maxAggregateSentiment;
 
     public AnalyzeNewsResponse() {
     }
@@ -18,12 +20,16 @@ public class AnalyzeNewsResponse {
             int itemCount,
             int skippedDuplicateCount,
             int clusteredCount,
-            int maxHotness) {
+            int maxOverallHotness,
+            Double minAggregateSentiment,
+            Double maxAggregateSentiment) {
         this.batchIds = batchIds;
         this.itemCount = itemCount;
         this.skippedDuplicateCount = skippedDuplicateCount;
         this.clusteredCount = clusteredCount;
-        this.maxHotness = maxHotness;
+        this.maxOverallHotness = maxOverallHotness;
+        this.minAggregateSentiment = minAggregateSentiment;
+        this.maxAggregateSentiment = maxAggregateSentiment;
     }
 
     public List<Long> getBatchIds() {
@@ -58,11 +64,27 @@ public class AnalyzeNewsResponse {
         this.clusteredCount = clusteredCount;
     }
 
-    public int getMaxHotness() {
-        return maxHotness;
+    public int getMaxOverallHotness() {
+        return maxOverallHotness;
     }
 
-    public void setMaxHotness(int maxHotness) {
-        this.maxHotness = maxHotness;
+    public void setMaxOverallHotness(int maxOverallHotness) {
+        this.maxOverallHotness = maxOverallHotness;
+    }
+
+    public Double getMinAggregateSentiment() {
+        return minAggregateSentiment;
+    }
+
+    public void setMinAggregateSentiment(Double minAggregateSentiment) {
+        this.minAggregateSentiment = minAggregateSentiment;
+    }
+
+    public Double getMaxAggregateSentiment() {
+        return maxAggregateSentiment;
+    }
+
+    public void setMaxAggregateSentiment(Double maxAggregateSentiment) {
+        this.maxAggregateSentiment = maxAggregateSentiment;
     }
 }

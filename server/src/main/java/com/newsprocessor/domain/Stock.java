@@ -21,6 +21,9 @@ public class Stock {
     @Column(name = "name", length = 100)
     private String name;
 
+    @Column(name = "enabled", nullable = false)
+    private boolean enabled = true;
+
     public Stock() {
     }
 
@@ -46,5 +49,13 @@ public class Stock {
 
     public void setName(String name) {
         this.name = name;
+    }
+
+    public boolean isEnabled() {
+        return enabled;
+    }
+
+    public void setEnabled(boolean enabled) {
+        this.enabled = enabled;
     }
 }

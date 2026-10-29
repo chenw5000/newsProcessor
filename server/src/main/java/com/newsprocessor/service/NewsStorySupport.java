@@ -1,17 +1,23 @@
 package com.newsprocessor.service;
 
+import com.newsprocessor.domain.NewsItem;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Comparator;
+import java.util.HashMap;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Set;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
 /**
- * V1 fingerprinting and V2 near-duplicate / hotness helpers for news items.
+ * V1 fingerprinting and V2 story-cluster metric helpers.
  */
 final class NewsStorySupport {
 
@@ -63,7 +69,8 @@ final class NewsStorySupport {
         return union.isEmpty() ? 0.0 : (double) intersection.size() / union.size();
     }
 
-    static int tierWeight(String mediaTier) {
+    /** Item hotness / overall-hotness tier weight: Tier1=3, Tier2=2, Tier3=1. */
+    static int tierHotnessWeight(String mediaTier) {
         if (mediaTier == null) {
             return 1;
         }
@@ -80,26 +87,83 @@ final class NewsStorySupport {
         return 1;
     }
 
+    /** Sentiment aggregation weight aligned with NSI prompt: 1.5 / 1.0 / 1.2. */
+    static double tierSentimentWeight(String mediaTier) {
+        if (mediaTier == null) {
+            return 1.0;
+        }
+        String value = mediaTier.toLowerCase(Locale.ROOT);
+        if (value.contains("1")) {
+            return 1.5;
+        }
+        if (value.contains("3")) {
+            return 1.2;
+        }
+        if (value.contains("2")) {
+            return 1.0;
+        }
+        return 1.0;
+    }
+
     /**
-     * Basic hotness: sum of tier weights across distinct normalized sources in a cluster.
-     * One outlet counted once even if it appears multiple times.
+     * One representative item per distinct source (latest by createdAt, then id).
      */
-    static int computeHotness(Iterable<String> sources, Iterable<String> mediaTiers) {
-        Set<String> seen = new HashSet<>();
+    static List<NewsItem> latestPerSource(List<NewsItem> clusterItems) {
+        Map<String, NewsItem> bySource = new HashMap<>();
+        List<NewsItem> ordered = new ArrayList<>(clusterItems);
+        ordered.sort(Comparator
+                .comparing(NewsItem::getCreatedAt, Comparator.nullsLast(Comparator.naturalOrder()))
+                .thenComparing(NewsItem::getId, Comparator.nullsLast(Comparator.naturalOrder())));
+        for (NewsItem item : ordered) {
+            String key = normalizeSource(item.getSource());
+            if (key.isEmpty()) {
+                key = "unknown-" + (item.getId() == null ? bySource.size() : item.getId());
+            }
+            bySource.put(key, item);
+        }
+        return List.copyOf(bySource.values());
+    }
+
+    /** Overall story hotness: sum of tier hotness weights across distinct sources. */
+    static int computeOverallHotness(List<NewsItem> clusterItems) {
         int total = 0;
-        var sourceIt = sources.iterator();
-        var tierIt = mediaTiers.iterator();
-        while (sourceIt.hasNext() && tierIt.hasNext()) {
-            String sourceKey = normalizeSource(sourceIt.next());
-            String tier = tierIt.next();
-            if (sourceKey.isEmpty()) {
-                sourceKey = "unknown-" + seen.size();
-            }
-            if (seen.add(sourceKey)) {
-                total += tierWeight(tier);
-            }
+        for (NewsItem item : latestPerSource(clusterItems)) {
+            total += tierHotnessWeight(item.getMediaTier());
         }
         return Math.max(total, 1);
+    }
+
+    /**
+     * Tier-weighted average of member scores (−100…+100), one latest item per source.
+     */
+    static Double computeAggregateSentiment(List<NewsItem> clusterItems) {
+        List<NewsItem> reps = latestPerSource(clusterItems);
+        if (reps.isEmpty()) {
+            return null;
+        }
+        double weightedSum = 0.0;
+        double weightTotal = 0.0;
+        for (NewsItem item : reps) {
+            if (item.getScore() == null) {
+                continue;
+            }
+            double weight = tierSentimentWeight(item.getMediaTier());
+            weightedSum += weight * item.getScore();
+            weightTotal += weight;
+        }
+        if (weightTotal == 0.0) {
+            return null;
+        }
+        return weightedSum / weightTotal;
+    }
+
+    static NewsItem pickCanonicalItem(List<NewsItem> clusterItems) {
+        return clusterItems.stream()
+                .max(Comparator
+                        .comparingInt((NewsItem item) -> tierHotnessWeight(item.getMediaTier()))
+                        .thenComparing(NewsItem::getCreatedAt, Comparator.nullsLast(Comparator.naturalOrder()))
+                        .thenComparing(NewsItem::getId, Comparator.nullsLast(Comparator.naturalOrder())))
+                .orElse(null);
     }
 
     private static Set<String> tokens(String normalizedHeadline) {

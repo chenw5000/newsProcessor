@@ -56,8 +56,8 @@ public class NewsItem {
     @Column(name = "story_cluster_id")
     private Long storyClusterId;
 
-    @Column(name = "hotness", nullable = false)
-    private Integer hotness = 1;
+    @Column(name = "item_hotness", nullable = false)
+    private Integer itemHotness = 1;
 
     @Column(name = "created_at", nullable = false)
     private Instant createdAt;
@@ -177,12 +177,12 @@ public class NewsItem {
         this.storyClusterId = storyClusterId;
     }
 
-    public Integer getHotness() {
-        return hotness;
+    public Integer getItemHotness() {
+        return itemHotness;
     }
 
-    public void setHotness(Integer hotness) {
-        this.hotness = hotness;
+    public void setItemHotness(Integer itemHotness) {
+        this.itemHotness = itemHotness;
     }
 
     public Instant getCreatedAt() {
